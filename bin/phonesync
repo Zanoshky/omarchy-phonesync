@@ -1,0 +1,509 @@
+#!/usr/bin/env python3
+"""phonesync: Omarchy themes in step with Hyprtile and Phosphor, over KDE Connect.
+
+The launchers show up as their own devices in KDE Connect. Pair one, and:
+
+  * when you pick a theme in Omarchy, the phone gets its exact colours
+    (KDE Connect share text, starting with "zanolink-theme:");
+  * when you pick a theme on the phone, Omarchy switches to it: to its own
+    theme of the same name when it has one, else to a theme written from the
+    phone's colours into ~/.config/omarchy/themes/<app>-<name>.
+
+The phone offers its theme as a run command (the command text is the theme
+as JSON); kdeconnectd's remotecommands plugin puts that on DBus, where this
+reads it. Nothing is compiled into kdeconnectd. Only the Python standard
+library and busctl are used.
+
+  phonesync status            one JSON object: kdeconnect, devices, themes
+  phonesync watch             JSON lines for the bar widget, and the sync itself
+  phonesync pair|accept|reject|unpair <device-id>
+  phonesync push [device-id]  send the Omarchy theme to the phones now
+  phonesync setup             install KDE Connect and open the firewall (asks for sudo)
+
+Keep the wire format in step with Kdc.kt and Linked.kt in the launchers.
+"""
+import colorsys
+import hashlib
+import json
+import os
+import re
+import shutil
+import struct
+import subprocess
+import sys
+import threading
+import time
+import zlib
+
+BUS = "org.kde.kdeconnect"
+ROOT = "/modules/kdeconnect"
+PREFIX = "zanolink-theme:"
+COMMAND = "zanolink-theme"
+HOME = os.path.expanduser("~")
+STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME", os.path.join(HOME, ".local/state")), "phonesync")
+OMARCHY_STATE = os.path.join(HOME, ".local/state/omarchy/current")
+USER_THEMES = os.path.join(HOME, ".config/omarchy/themes")
+OMARCHY_PATH = os.environ.get("OMARCHY_PATH", os.path.join(HOME, ".local/share/omarchy"))
+# Phone theme names whose Omarchy twin has another name, and back.
+TO_OMARCHY = {"catppuccin-mocha": "catppuccin"}
+FROM_OMARCHY = {v: k for k, v in TO_OMARCHY.items()}
+APPS = ("hyprtile", "phosphor")
+
+
+# DBus, through busctl
+
+def busctl(*args, timeout=5):
+    try:
+        r = subprocess.run(["busctl", "--user", "--json=short", *args], capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0:
+        return None
+    out = []
+    for line in r.stdout.splitlines():
+        try:
+            out.append(json.loads(line))
+        except ValueError:
+            pass
+    return out
+
+
+def call(path, iface, method, sig="", *args):
+    r = busctl("call", BUS, path, iface, method, *([sig, *map(str, args)] if sig else []))
+    return r[0]["data"] if r else None
+
+
+def props(path, iface, *names):
+    r = busctl("get-property", BUS, path, iface, *names)
+    if not r or len(r) != len(names):
+        return {}
+    return {n: v.get("data") for n, v in zip(names, r)}
+
+
+def dev_path(did):
+    return f"{ROOT}/devices/{did}"
+
+
+def kdeconnect_state():
+    if not shutil.which("kdeconnectd") and not os.path.exists("/usr/bin/kdeconnectd") and not os.path.exists("/usr/lib/kdeconnectd"):
+        return "missing"
+    # A call starts the daemon through DBus activation when it is not running.
+    return "ok" if call(ROOT, "org.kde.kdeconnect.daemon", "selfId") is not None else "stopped"
+
+
+def device(did):
+    p = props(dev_path(did), "org.kde.kdeconnect.device",
+              "name", "type", "isReachable", "isPaired", "isPairRequested", "isPairRequestedByPeer", "verificationKey")
+    if not p:
+        return None
+    d = {
+        "id": did, "name": p["name"], "type": p["type"], "reachable": bool(p["isReachable"]), "paired": bool(p["isPaired"]),
+        "requested": bool(p["isPairRequested"]), "asks": bool(p["isPairRequestedByPeer"]), "key": p.get("verificationKey") or "",
+        "launcher": False, "theme": None,
+    }
+    if d["paired"] and d["reachable"]:
+        cmds = props(dev_path(did) + "/remotecommands", "org.kde.kdeconnect.device.remotecommands", "commands").get("commands")
+        if cmds is not None:
+            try:
+                entry = json.loads(bytes(cmds).decode("utf-8") or "{}").get(COMMAND)
+                if entry:
+                    d["launcher"] = True
+                    d["theme"] = json.loads(entry.get("command", "{}"))
+            except (ValueError, AttributeError, TypeError):
+                pass
+    # A launcher we have not paired yet: its name says which one.
+    if not d["launcher"] and re.match(r"^(Hyprtile|Phosphor) on ", d["name"] or ""):
+        d["launcher"] = True
+    return d
+
+
+def devices():
+    ids = call(ROOT, "org.kde.kdeconnect.daemon", "devices", "bb", "false", "false") or [[]]
+    out = [d for d in (device(i) for i in ids[0]) if d]
+    out.sort(key=lambda d: (not d["paired"], not d["launcher"], d["name"].lower()))
+    return out
+
+
+def self_name():
+    r = call(ROOT, "org.kde.kdeconnect.daemon", "announcedName")
+    return r[0] if r else ""
+
+
+# Omarchy themes
+
+def current_theme():
+    try:
+        with open(os.path.join(OMARCHY_STATE, "theme.name")) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def theme_changed_ms():
+    try:
+        return int(os.path.getmtime(os.path.join(OMARCHY_STATE, "theme.name")) * 1000)
+    except OSError:
+        return 0
+
+
+def theme_dir(name):
+    for base in (USER_THEMES, os.path.join(OMARCHY_PATH, "themes")):
+        p = os.path.join(base, name)
+        if os.path.isdir(p):
+            return p
+    return None
+
+
+def read_colors(path):
+    """colors.toml as a dict of strings. Flat key = "value" lines are all Omarchy uses."""
+    out = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                m = re.match(r'^\s*([A-Za-z0-9_]+)\s*=\s*"([^"]*)"', line)
+                if m:
+                    out[m.group(1)] = m.group(2)
+    except OSError:
+        pass
+    return out
+
+
+def gradient_colors(spec):
+    out = []
+    for m in re.finditer(r"rgba?\(\s*([0-9a-fA-F]{6})(?:[0-9a-fA-F]{2})?\s*\)|#([0-9a-fA-F]{6})\b", spec or ""):
+        out.append("#" + (m.group(1) or m.group(2)).lower())
+    return out
+
+
+def omarchy_theme():
+    """What we tell the phone about the current Omarchy theme."""
+    name = current_theme()
+    colors = read_colors(os.path.join(OMARCHY_STATE, "theme/colors.toml"))
+    if not name or "background" not in colors:
+        return None
+    t = {
+        "app": "omarchy", "theme": FROM_OMARCHY.get(name, name), "light": colors.get("mode") == "light",
+        "bg": colors.get("background"), "fg": colors.get("foreground"), "accent": colors.get("accent") or colors.get("blue"),
+        "colors": gradient_colors(colors.get("hyprland_active_border", "")) or [colors.get("accent", colors.get("foreground"))],
+        "palette": colors, "changed": theme_changed_ms(),
+    }
+    # A theme we wrote from a phone says where it came from, so that phone can use its own.
+    try:
+        with open(os.path.join(theme_dir(name) or "", "phonesync.json")) as f:
+            t["origin"] = json.load(f)
+    except (OSError, ValueError):
+        pass
+    return t
+
+
+def hx(c):
+    c = (c or "").lstrip("#")[-6:]
+    try:
+        return tuple(int(c[i:i + 2], 16) for i in (0, 2, 4))
+    except ValueError:
+        return (0, 0, 0)
+
+
+def to_hex(rgb):
+    return "#%02x%02x%02x" % tuple(max(0, min(255, int(round(v)))) for v in rgb)
+
+
+def mix(a, b, t):
+    a, b = hx(a), hx(b)
+    return to_hex(tuple(x * (1 - t) + y * t for x, y in zip(a, b)))
+
+
+def hue(base, deg):
+    """[base]'s lightness and saturation at another hue: terminal colours for a one hue phosphor theme."""
+    r, g, b = (v / 255 for v in hx(base))
+    h, l, s = colorsys.rgb_to_hls(r, g, b)
+    s = max(s, 0.55)
+    l = min(max(l, 0.45), 0.7)
+    return to_hex(tuple(v * 255 for v in colorsys.hls_to_rgb(deg / 360, l, s)))
+
+
+def colors_from_phone(t):
+    """A full Omarchy colors.toml from a launcher's theme."""
+    bg, fg, accent = t.get("bg", "#000000"), t.get("fg", "#ffffff"), t.get("accent", "#0068ff")
+    light = bool(t.get("light"))
+    dim = t.get("dim") or mix(fg, bg, 0.45)
+    ansi = t.get("ansi") or []
+    if len(ansi) >= 16:
+        red, green, yellow, blue, magenta, cyan = ansi[1:7]
+        bred, bgreen, byellow, bblue, bmagenta, bcyan = ansi[9:15]
+        bright_fg = ansi[15]
+    else:
+        red = t.get("warn") or t.get("urgent") or hue(accent, 0)
+        yellow, green, cyan, blue, magenta = (t.get("sun") or hue(accent, 45)), hue(accent, 125), hue(accent, 185), hue(accent, 220), hue(accent, 300)
+        to = "#000000" if light else "#ffffff"
+        bred, bgreen, byellow, bblue, bmagenta, bcyan = (mix(c, to, 0.25) for c in (red, green, yellow, blue, magenta, cyan))
+        bright_fg = t.get("bright") or mix(fg, to, 0.3)
+    shade = "#ffffff" if light else "#000000"
+    surface = t.get("surface") if t.get("surface") and t.get("surface") != bg else mix(bg, fg, 0.07)
+    border = t.get("colors") or [accent]
+    c = {
+        "mode": "light" if light else "dark",
+        "accent": accent, "selection": mix(bg, accent, 0.28), "muted": t.get("inactive") or t.get("faint") or mix(dim, bg, 0.35),
+        "background": bg, "dark_background": mix(bg, shade, 0.2), "darker_background": mix(bg, shade, 0.4), "lighter_background": surface,
+        "foreground": fg, "dark_foreground": dim, "light_foreground": mix(fg, bright_fg, 0.5), "bright_foreground": bright_fg,
+        "red": red, "yellow": yellow, "orange": mix(red, yellow, 0.5), "green": green, "cyan": cyan, "blue": blue, "magenta": magenta,
+        "brown": mix(red, "#000000", 0.5),
+        "bright_red": bred, "bright_yellow": byellow, "bright_green": bgreen, "bright_cyan": bcyan, "bright_blue": bblue, "bright_magenta": bmagenta,
+        "hyprland_active_border": " ".join("rgba(%see)" % c.lstrip("#")[-6:] for c in border) + (" 45deg" if len(border) > 1 else ""),
+    }
+    return c
+
+
+def write_png(path, w, h, pixel):
+    rows = bytearray()
+    for y in range(h):
+        rows.append(0)
+        for x in range(w):
+            rows.extend(pixel(x, y))
+    def chunk(kind, data):
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+    png = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)) + chunk(b"IDAT", zlib.compress(bytes(rows), 9)) + chunk(b"IEND", b"")
+    with open(path, "wb") as f:
+        f.write(png)
+
+
+def background(path, c, wall):
+    """A quiet backdrop in the theme's colours: a diagonal fade with a soft glow of the accent."""
+    w, h = 640, 360
+    a, b = hx(wall[0] if wall else c["darker_background"]), hx(wall[1] if len(wall) > 1 else c["background"])
+    g = hx(c["accent"])
+    def pixel(x, y):
+        t = (x / w + y / h) / 2
+        base = [a[i] * (1 - t) + b[i] * t for i in range(3)]
+        dx, dy = (x - w * 0.72) / w, (y - h * 0.3) / h
+        glow = max(0.0, 1 - (dx * dx + dy * dy) * 6) ** 2 * 0.35
+        return bytes(int(base[i] * (1 - glow) + g[i] * glow) for i in range(3))
+    write_png(path, w, h, pixel)
+
+
+def theme_for_phone(t):
+    """The Omarchy theme name for a phone theme, writing one from its colours when needed."""
+    name = (t.get("theme") or "").lower()
+    app = t.get("app") if t.get("app") in APPS else "phone"
+    origin = t.get("origin") or {}
+    # A theme that came from Omarchy and went back to the phone keeps its name.
+    if t.get("app") == "omarchy" or origin.get("app") == "omarchy":
+        return None
+    twin = TO_OMARCHY.get(name, name)
+    if twin and theme_dir(twin) and not os.path.exists(os.path.join(theme_dir(twin), "phonesync.json")):
+        return twin
+    slug = re.sub(r"[^a-z0-9-]", "-", f"{app}-{name or 'theme'}")[:40]
+    d = os.path.join(USER_THEMES, slug)
+    os.makedirs(os.path.join(d, "backgrounds"), exist_ok=True)
+    c = colors_from_phone(t)
+    with open(os.path.join(d, "colors.toml"), "w") as f:
+        f.write(f"# Written by phonesync from {app} theme {name}. It is rewritten when that theme changes on the phone.\n")
+        for k, v in c.items():
+            f.write(f'{k} = "{v}"\n')
+    with open(os.path.join(d, "phonesync.json"), "w") as f:
+        json.dump({"app": app, "theme": name}, f)
+    if c.get("mode") == "light":
+        open(os.path.join(d, "light.mode"), "w").close()
+    elif os.path.exists(os.path.join(d, "light.mode")):
+        os.remove(os.path.join(d, "light.mode"))
+    background(os.path.join(d, "backgrounds", "1-phonesync.png"), c, t.get("wall") or [])
+    return slug
+
+
+# Sync
+
+class Sync:
+    """Both directions, with the newer side winning after time apart and no echoes."""
+
+    def __init__(self, emit):
+        self.emit = emit
+        os.makedirs(STATE_DIR, exist_ok=True)
+        self.path = os.path.join(STATE_DIR, "state.json")
+        try:
+            with open(self.path) as f:
+                self.s = json.load(f)
+        except (OSError, ValueError):
+            self.s = {}
+        self.s.setdefault("seen", {})       # device id -> hash of the last phone theme handled
+        self.s.setdefault("sent", {})       # device id -> hash of the last Omarchy theme sent
+        self.s.setdefault("ours", {})       # theme name we set ourselves -> its phone "changed"
+        self.last_name = current_theme()
+        self.last = {}
+
+    def save(self):
+        tmp = self.path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(self.s, f)
+        os.replace(tmp, self.path)
+
+    def desktop_changed(self):
+        """When the user last picked a theme here; a switch we made ourselves counts as the phone's time."""
+        name = current_theme()
+        ours = self.s["ours"].get(name)
+        return ours if ours is not None else theme_changed_ms()
+
+    def tick(self, devs):
+        name = current_theme()
+        if name != self.last_name:
+            self.last_name = name
+            if name not in self.s["ours"]:
+                self.s["ours"] = {}
+            self.save()
+        for d in devs:
+            if not (d["paired"] and d["reachable"] and d["launcher"]):
+                continue
+            t = d.get("theme")
+            if t:
+                self.from_phone(d, t)
+            self.to_phone(d)
+
+    def from_phone(self, d, t):
+        h = hashlib.sha256(json.dumps(t, sort_keys=True).encode()).hexdigest()
+        if self.s["seen"].get(d["id"]) == h:
+            return
+        self.s["seen"][d["id"]] = h
+        self.save()
+        if t.get("echo") or int(t.get("changed") or 0) <= self.desktop_changed():
+            return
+        name = theme_for_phone(t)
+        if not name:
+            return
+        self.s["ours"] = {name: int(t.get("changed") or 0)}
+        self.s["sent"][d["id"]] = None
+        self.save()
+        subprocess.run(["omarchy-theme-set", name], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.emit({"type": "synced", "direction": "in", "device": d["name"], "theme": t.get("theme"), "omarchy": name, "at": int(time.time() * 1000)})
+
+    def to_phone(self, d, force=False):
+        t = omarchy_theme()
+        if not t:
+            return
+        mine = current_theme()
+        if not force:
+            # The phone's own theme is newer, or this is the theme it gave us: nothing to send.
+            pt = d.get("theme") or {}
+            if mine in self.s["ours"]:
+                return
+            if int(pt.get("changed") or 0) >= self.desktop_changed() and not pt.get("echo"):
+                return
+        t["changed"] = self.desktop_changed()
+        h = hashlib.sha256(json.dumps(t, sort_keys=True).encode()).hexdigest()
+        if not force and self.s["sent"].get(d["id"]) == h:
+            return
+        if call(dev_path(d["id"]) + "/share", "org.kde.kdeconnect.device.share", "shareText", "s", PREFIX + json.dumps(t)) is None:
+            return
+        self.s["sent"][d["id"]] = h
+        self.save()
+        self.emit({"type": "synced", "direction": "out", "device": d["name"], "theme": mine, "at": int(time.time() * 1000)})
+
+
+def status():
+    k = kdeconnect_state()
+    out = {"type": "state", "kdeconnect": k, "name": "", "devices": [], "theme": current_theme()}
+    if k == "ok":
+        out["name"] = self_name()
+        out["devices"] = devices()
+    return out
+
+
+def watch():
+    lock = threading.Lock()
+    def emit(o):
+        with lock:
+            sys.stdout.write(json.dumps(o) + "\n")
+            sys.stdout.flush()
+    sync = Sync(emit)
+    wake = threading.Event()
+
+    def monitor():
+        # Any message from kdeconnectd means something may have changed; look again soon.
+        while True:
+            try:
+                p = subprocess.Popen(["busctl", "--user", "monitor", BUS], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+                for _ in p.stdout:
+                    wake.set()
+            except OSError:
+                pass
+            time.sleep(5)
+
+    threading.Thread(target=monitor, daemon=True).start()
+    last = None
+    theme_mtime = theme_changed_ms()
+    next_full = 0.0
+    while True:
+        now = time.time()
+        mt = theme_changed_ms()
+        if wake.is_set() or mt != theme_mtime or now >= next_full:
+            time.sleep(0.3)
+            wake.clear()
+            theme_mtime = mt
+            next_full = now + 10
+            st = status()
+            if st["kdeconnect"] == "ok":
+                try:
+                    sync.tick(st["devices"])
+                except Exception as e:  # keep watching whatever one phone sent
+                    emit({"type": "error", "message": str(e)})
+                st["theme"] = current_theme()
+            for d in st["devices"]:
+                d.pop("theme", None) if d.get("theme") is None else d.update(theme={"theme": d["theme"].get("theme"), "app": d["theme"].get("app")})
+            if st != last:
+                emit(st)
+                last = st
+        wake.wait(1.0)
+
+
+def setup():
+    def run(cmd):
+        print("$ " + " ".join(cmd), flush=True)
+        return subprocess.run(cmd).returncode == 0
+    print("Phone Sync setup\n")
+    if kdeconnect_state() == "missing":
+        print("Installing KDE Connect.")
+        if shutil.which("omarchy-pkg-add"):
+            run(["omarchy-pkg-add", "kdeconnect"])
+        else:
+            run(["sudo", "pacman", "-S", "--needed", "--noconfirm", "kdeconnect"])
+    if shutil.which("ufw"):
+        print("\nOpening the KDE Connect ports (1714 to 1764) in the firewall.")
+        run(["sudo", "ufw", "allow", "1714:1764/udp", "comment", "kdeconnect"])
+        run(["sudo", "ufw", "allow", "1714:1764/tcp", "comment", "kdeconnect"])
+    state = kdeconnect_state()
+    print("\nKDE Connect is " + ("running." if state == "ok" else state + "."))
+    if state == "ok":
+        call(ROOT, "org.kde.kdeconnect.daemon", "forceOnNetworkChange")
+        print("This computer shows up as: " + self_name())
+        print("\nOn the phone: open the link menu in Hyprtile or Phosphor, turn link on,")
+        print("then pair this computer from there or from the Phone Sync panel in the bar.")
+    input("\nPress Enter to close. ")
+
+
+def main():
+    a = sys.argv[1:]
+    cmd = a[0] if a else "status"
+    if cmd == "status":
+        print(json.dumps(status(), indent=2))
+    elif cmd == "watch":
+        try:
+            watch()
+        except (KeyboardInterrupt, BrokenPipeError):
+            pass
+    elif cmd in ("pair", "accept", "reject", "unpair") and len(a) == 2:
+        method = {"pair": "requestPairing", "accept": "acceptPairing", "reject": "cancelPairing", "unpair": "unpair"}[cmd]
+        sys.exit(0 if call(dev_path(a[1]), "org.kde.kdeconnect.device", method) is not None else 1)
+    elif cmd == "push":
+        sync = Sync(lambda o: print(json.dumps(o)))
+        for d in devices():
+            if d["paired"] and d["reachable"] and d["launcher"] and (len(a) < 2 or d["id"] == a[1]):
+                sync.to_phone(d, force=True)
+    elif cmd == "refresh":
+        call(ROOT, "org.kde.kdeconnect.daemon", "forceOnNetworkChange")
+    elif cmd == "setup":
+        setup()
+    else:
+        print(__doc__.strip())
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()
