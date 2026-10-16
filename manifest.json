@@ -5,7 +5,7 @@
   "version": "1.0.0",
   "author": "Marko Zanoski",
   "license": "MIT",
-  "description": "Pair your phone over KDE Connect and keep its theme in step with Omarchy. Works with the Hyprtile and Phosphor launchers.",
+  "description": "Pair your phone and keep its theme in step with Omarchy, both ways. For the Hyprtile and Phosphor launchers; nothing to install.",
   "kinds": [
     "bar-widget"
   ],
@@ -14,7 +14,7 @@
   },
   "barWidget": {
     "displayName": "Phone Sync",
-    "description": "Set up KDE Connect, pair your phone, and sync themes both ways.",
+    "description": "Pair your phone and sync themes both ways.",
     "category": "Network",
     "allowMultiple": false,
     "defaultSection": "right"

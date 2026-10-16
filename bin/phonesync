@@ -1,33 +1,37 @@
 #!/usr/bin/env python3
-"""phonesync: Omarchy themes in step with Hyprtile and Phosphor, over KDE Connect.
+"""phonesync: Omarchy themes in step with Hyprtile and Phosphor, over their link.
 
-The launchers show up as their own devices in KDE Connect. Pair one, and:
+Pair a phone once, then:
 
-  * when you pick a theme in Omarchy, the phone gets its exact colours
-    (KDE Connect share text, starting with "zanolink-theme:");
+  * when you pick a theme in Omarchy, the phone gets its exact colours;
   * when you pick a theme on the phone, Omarchy switches to it: to its own
     theme of the same name when it has one, else to a theme written from the
     phone's colours into ~/.config/omarchy/themes/<app>-<name>.
 
-The phone offers its theme as a run command (the command text is the theme
-as JSON); kdeconnectd's remotecommands plugin puts that on DBus, where this
-reads it. Nothing is compiled into kdeconnectd. Only the Python standard
-library and busctl are used.
+The computer always connects out to the phone and holds the line open, so
+nothing needs installing and no port needs opening here. Phones are found
+over mDNS (avahi-browse, which Omarchy ships), or by the address the phone's
+link menu shows. Only the Python standard library is used.
 
-  phonesync status            one JSON object: kdeconnect, devices, themes
-  phonesync watch             JSON lines for the bar widget, and the sync itself
-  phonesync pair|accept|reject|unpair <device-id>
-  phonesync push [device-id]  send the Omarchy theme to the phones now
-  phonesync setup             install KDE Connect and open the firewall (asks for sudo)
+  phonesync watch             JSON lines for the bar widget, and the sync itself;
+                              takes commands on stdin: scan, pair HOST PORT,
+                              answer yes|no, forget ID, push
+  phonesync pair HOST [PORT]  pair from a terminal (47800 Hyprtile, 47801 Phosphor)
+  phonesync peers             paired phones, as JSON
 
-Keep the wire format in step with Kdc.kt and Linked.kt in the launchers.
+The protocol is Link.kt in the launchers; tools/zanolink.py there speaks it
+too, and shares this identity and peer list in ~/.config/zanolink.
 """
 import colorsys
 import hashlib
+import hmac
 import json
 import os
+import queue
 import re
+import secrets
 import shutil
+import socket
 import struct
 import subprocess
 import sys
@@ -35,98 +39,177 @@ import threading
 import time
 import zlib
 
-BUS = "org.kde.kdeconnect"
-ROOT = "/modules/kdeconnect"
-PREFIX = "zanolink-theme:"
-COMMAND = "zanolink-theme"
 HOME = os.path.expanduser("~")
+CONF = os.path.join(HOME, ".config/zanolink")
 STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME", os.path.join(HOME, ".local/state")), "phonesync")
 OMARCHY_STATE = os.path.join(HOME, ".local/state/omarchy/current")
 USER_THEMES = os.path.join(HOME, ".config/omarchy/themes")
 OMARCHY_PATH = os.environ.get("OMARCHY_PATH", os.path.join(HOME, ".local/share/omarchy"))
+SERVICE = "_zanolink._tcp"
+PORTS = {"hyprtile": 47800, "phosphor": 47801}
+PAIR_TIMEOUT = 90
 # Phone theme names whose Omarchy twin has another name, and back.
 TO_OMARCHY = {"catppuccin-mocha": "catppuccin"}
 FROM_OMARCHY = {v: k for k, v in TO_OMARCHY.items()}
 APPS = ("hyprtile", "phosphor")
 
 
-# DBus, through busctl
+# Link: keys, pairing, signed messages. Keep in step with Link.kt.
 
-def busctl(*args, timeout=5):
+P = 2**255 - 19
+A24 = 121665
+
+
+def x25519(k, u):
+    """RFC 7748."""
+    k = bytearray(k)
+    k[0] &= 248
+    k[31] = (k[31] & 127) | 64
+    kn = int.from_bytes(k, "little")
+    uu = bytearray(u)
+    uu[31] &= 127
+    x1 = int.from_bytes(uu, "little") % P
+    x2, z2, x3, z3, swap = 1, 0, x1, 1, 0
+    for t in range(254, -1, -1):
+        bit = (kn >> t) & 1
+        if swap ^ bit:
+            x2, x3, z2, z3 = x3, x2, z3, z2
+        swap = bit
+        a = x2 + z2; aa = a * a % P
+        b = x2 - z2; bb = b * b % P
+        e = aa - bb
+        c = x3 + z3; d = x3 - z3
+        da = d * a % P; cb = c * b % P
+        x3 = (da + cb) ** 2 % P
+        z3 = x1 * (da - cb) ** 2 % P
+        x2 = aa * bb % P
+        z2 = e * (aa + A24 * e) % P
+    if swap:
+        x2, z2 = x3, z3
+    return (x2 * pow(z2, P - 2, P) % P).to_bytes(32, "little")
+
+
+def sha(b):
+    return hashlib.sha256(b).digest()
+
+
+def load(name, default):
     try:
-        r = subprocess.run(["busctl", "--user", "--json=short", *args], capture_output=True, text=True, timeout=timeout)
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    if r.returncode != 0:
-        return None
-    out = []
-    for line in r.stdout.splitlines():
-        try:
-            out.append(json.loads(line))
-        except ValueError:
-            pass
-    return out
+        with open(os.path.join(CONF, name)) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
 
 
-def call(path, iface, method, sig="", *args):
-    r = busctl("call", BUS, path, iface, method, *([sig, *map(str, args)] if sig else []))
-    return r[0]["data"] if r else None
+def save(name, data):
+    os.makedirs(CONF, mode=0o700, exist_ok=True)
+    path = os.path.join(CONF, name)
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, path)
 
 
-def props(path, iface, *names):
-    r = busctl("get-property", BUS, path, iface, *names)
-    if not r or len(r) != len(names):
-        return {}
-    return {n: v.get("data") for n, v in zip(names, r)}
+def identity():
+    me = load("key.json", None)
+    if not me:
+        me = {"priv": secrets.token_bytes(32).hex(), "name": socket.gethostname().split(".")[0][:40] or "computer"}
+        save("key.json", me)
+    priv = bytes.fromhex(me["priv"])
+    pub = x25519(priv, bytes([9] + [0] * 31))
+    return priv, pub, sha(pub).hex()[:12], me["name"]
 
 
-def dev_path(did):
-    return f"{ROOT}/devices/{did}"
+class Line:
+    def __init__(self, host, port, timeout=PAIR_TIMEOUT + 5):
+        self.s = socket.create_connection((host, port), timeout=5)
+        self.s.settimeout(timeout)
+        self.f = self.s.makefile("rwb")
+        self.lock = threading.Lock()
 
+    def send(self, o):
+        with self.lock:
+            self.f.write((json.dumps(o) + "\n").encode())
+            self.f.flush()
 
-def kdeconnect_state():
-    if not shutil.which("kdeconnectd") and not os.path.exists("/usr/bin/kdeconnectd") and not os.path.exists("/usr/lib/kdeconnectd"):
-        return "missing"
-    # A call starts the daemon through DBus activation when it is not running.
-    return "ok" if call(ROOT, "org.kde.kdeconnect.daemon", "selfId") is not None else "stopped"
+    def recv(self):
+        line = self.f.readline(1 << 20)
+        if not line:
+            raise ConnectionError("the phone closed the line")
+        return json.loads(line)
 
-
-def device(did):
-    p = props(dev_path(did), "org.kde.kdeconnect.device",
-              "name", "type", "isReachable", "isPaired", "isPairRequested", "isPairRequestedByPeer", "verificationKey")
-    if not p:
-        return None
-    d = {
-        "id": did, "name": p["name"], "type": p["type"], "reachable": bool(p["isReachable"]), "paired": bool(p["isPaired"]),
-        "requested": bool(p["isPairRequested"]), "asks": bool(p["isPairRequestedByPeer"]), "key": p.get("verificationKey") or "",
-        "launcher": False, "theme": None,
-    }
-    if d["paired"] and d["reachable"]:
-        cmds = props(dev_path(did) + "/remotecommands", "org.kde.kdeconnect.device.remotecommands", "commands").get("commands")
-        if cmds is not None:
+    def close(self):
+        for c in (self.f, self.s):
             try:
-                entry = json.loads(bytes(cmds).decode("utf-8") or "{}").get(COMMAND)
-                if entry:
-                    d["launcher"] = True
-                    d["theme"] = json.loads(entry.get("command", "{}"))
-            except (ValueError, AttributeError, TypeError):
+                c.close()
+            except OSError:
                 pass
-    # A launcher we have not paired yet: its name says which one.
-    if not d["launcher"] and re.match(r"^(Hyprtile|Phosphor) on ", d["name"] or ""):
-        d["launcher"] = True
-    return d
 
 
-def devices():
-    ids = call(ROOT, "org.kde.kdeconnect.daemon", "devices", "bb", "false", "false") or [[]]
-    out = [d for d in (device(i) for i in ids[0]) if d]
-    out.sort(key=lambda d: (not d["paired"], not d["launcher"], d["name"].lower()))
-    return out
+def signed(key, kind, my_id, body=""):
+    ts = int(time.time() * 1000)
+    mac = hmac.new(key, f"{kind}.{ts}.{body}".encode(), hashlib.sha256).hexdigest()
+    return {"t": kind, "id": my_id, "ts": ts, "body": body, "mac": mac}
 
 
-def self_name():
-    r = call(ROOT, "org.kde.kdeconnect.daemon", "announcedName")
-    return r[0] if r else ""
+def verified(key, m):
+    mac = hmac.new(key, f"{m.get('t')}.{m.get('ts')}.{m.get('body')}".encode(), hashlib.sha256).hexdigest()
+    return hmac.compare_digest(mac, str(m.get("mac", "")))
+
+
+def pair(host, port, ask):
+    """Pairs with the phone at host:port. [ask](name, app, code) says whether the user saw the same code."""
+    priv, pub, my_id, name = identity()
+    ln = Line(host, port)
+    try:
+        nonce = secrets.token_bytes(16)
+        ln.send({"t": "hello", "v": 1, "app": "omarchy", "name": name, "id": my_id, "port": 0, "commit": sha(pub + nonce).hex()})
+        h = ln.recv()
+        their = bytes.fromhex(h.get("pub", ""))
+        their_nonce = bytes.fromhex(h.get("nonce", ""))
+        if len(their) != 32 or len(their_nonce) != 16:
+            raise ValueError("the phone sent a bad hello")
+        ln.send({"t": "reveal", "pub": pub.hex(), "nonce": nonce.hex()})
+        shared = x25519(priv, their)
+        if not any(shared):
+            raise ValueError("bad key")
+        lo, hi = sorted([pub, their], key=lambda b: b.hex())
+        code = "%06d" % (int.from_bytes(sha(b"zanolink-code" + shared + lo + hi + nonce + their_nonce)[:4], "big") % 1_000_000)
+        pname, papp = str(h.get("name") or "phone")[:40], str(h.get("app") or "")
+        yes = bool(ask(pname, papp, code))
+        ln.send({"t": "ok" if yes else "no"})
+        theirs = ln.recv().get("t") == "ok"
+        if not (yes and theirs):
+            return None
+        pid = sha(their).hex()[:12]
+        peers = load("peers.json", {})
+        peers[pid] = {"name": pname, "app": papp, "addr": f"{host}:{port}", "key": sha(b"zanolink-key" + shared).hex()}
+        save("peers.json", peers)
+        return pid
+    finally:
+        ln.close()
+
+
+def scan(seconds=3):
+    """Launchers with link on, found over mDNS: {id: {name, app, host, port}}."""
+    if not shutil.which("avahi-browse"):
+        return {}
+    try:
+        out = subprocess.run(["avahi-browse", "-rptk", SERVICE], capture_output=True, text=True, timeout=seconds + 5).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    found = {}
+    for line in out.splitlines():
+        f = line.split(";")
+        if len(f) < 10 or f[0] != "=" or f[2] != "IPv4":
+            continue
+        txt = dict(re.findall(r'"([a-z]+)=([^"]*)"', f[9]))
+        if txt.get("id"):
+            found[txt["id"]] = {"id": txt["id"], "name": txt.get("name") or f[3], "app": txt.get("app", ""), "host": f[7], "port": int(f[8])}
+    return found
+
+
 
 
 # Omarchy themes
@@ -268,16 +351,18 @@ def write_png(path, w, h, pixel):
 
 
 def background(path, c, wall):
-    """A quiet backdrop in the theme's colours: a diagonal fade with a soft glow of the accent."""
-    w, h = 640, 360
+    """A quiet backdrop in the theme's colours: a diagonal fade with a soft glow of the accent.
+    Drawn at 4K so it stays sharp on big screens, with a little dither so the fade does not band."""
+    w, h = 3840, 2160
     a, b = hx(wall[0] if wall else c["darker_background"]), hx(wall[1] if len(wall) > 1 else c["background"])
     g = hx(c["accent"])
+    noise = [((i * 2654435761) >> 7) % 100 / 100 for i in range(4096)]
     def pixel(x, y):
         t = (x / w + y / h) / 2
-        base = [a[i] * (1 - t) + b[i] * t for i in range(3)]
         dx, dy = (x - w * 0.72) / w, (y - h * 0.3) / h
         glow = max(0.0, 1 - (dx * dx + dy * dy) * 6) ** 2 * 0.35
-        return bytes(int(base[i] * (1 - glow) + g[i] * glow) for i in range(3))
+        n = noise[(x * 31 + y * 17) & 4095]
+        return bytes(int((a[i] * (1 - t) + b[i] * t) * (1 - glow) + g[i] * glow + n) for i in range(3))
     write_png(path, w, h, pixel)
 
 
@@ -289,6 +374,9 @@ def theme_for_phone(t):
     # A theme that came from Omarchy and went back to the phone keeps its name.
     if t.get("app") == "omarchy" or origin.get("app") == "omarchy":
         return None
+    # A theme the phone got from Omarchy ("omarchy-nord") goes back to that theme.
+    if name.startswith("omarchy-"):
+        name = name[len("omarchy-"):]
     twin = TO_OMARCHY.get(name, name)
     if twin and theme_dir(twin) and not os.path.exists(os.path.join(theme_dir(twin), "phonesync.json")):
         return twin
@@ -296,213 +384,368 @@ def theme_for_phone(t):
     d = os.path.join(USER_THEMES, slug)
     os.makedirs(os.path.join(d, "backgrounds"), exist_ok=True)
     c = colors_from_phone(t)
+    text = f"# Written by phonesync from {app} theme {name}. It is rewritten when that theme changes on the phone.\n"
+    text += "".join(f'{k} = "{v}"\n' for k, v in c.items())
+    try:
+        with open(os.path.join(d, "colors.toml")) as f:
+            same = f.read() == text
+    except OSError:
+        same = False
+    bg = os.path.join(d, "backgrounds", "1-phonesync.png")
+    if same and os.path.exists(bg):
+        return slug
     with open(os.path.join(d, "colors.toml"), "w") as f:
-        f.write(f"# Written by phonesync from {app} theme {name}. It is rewritten when that theme changes on the phone.\n")
-        for k, v in c.items():
-            f.write(f'{k} = "{v}"\n')
+        f.write(text)
     with open(os.path.join(d, "phonesync.json"), "w") as f:
         json.dump({"app": app, "theme": name}, f)
     if c.get("mode") == "light":
         open(os.path.join(d, "light.mode"), "w").close()
     elif os.path.exists(os.path.join(d, "light.mode")):
         os.remove(os.path.join(d, "light.mode"))
-    background(os.path.join(d, "backgrounds", "1-phonesync.png"), c, t.get("wall") or [])
+    background(bg, c, t.get("wall") or [])
     return slug
 
 
-# Sync
+# The daemon
 
-class Sync:
-    """Both directions, with the newer side winning after time apart and no echoes."""
+class Daemon:
+    """Holds a line open to every paired phone, syncs both ways, and reports to the bar widget.
 
-    def __init__(self, emit):
-        self.emit = emit
+    Which side wins: each theme carries "changed", when a person last picked
+    it. A phone theme is taken when it is newer than the Omarchy one; else the
+    phone is sent the Omarchy theme. "echo" marks a phone theme that came from
+    a computer, so it never counts as the phone's own pick.
+    """
+
+    def __init__(self, out=sys.stdout):
+        self.out = out
+        self.lock = threading.RLock()
+        _, _, self.id, self.name = identity()
+        self.found = {}
+        self.lines = {}        # peer id -> open Line
+        self.shows = {}        # peer id -> theme name the phone shows
+        self.denied = {}       # peer id -> time the phone said it does not know us
+        self.keepers = set()
+        self.pairing = None
+        self.answers = queue.Queue()
+        self.status = ""
+        self.last = None
+        self.last_ts = 0
+        self.scan_now = threading.Event()
         os.makedirs(STATE_DIR, exist_ok=True)
-        self.path = os.path.join(STATE_DIR, "state.json")
+        self.ours_path = os.path.join(STATE_DIR, "ours.json")
         try:
-            with open(self.path) as f:
-                self.s = json.load(f)
+            with open(self.ours_path) as f:
+                self.ours = json.load(f)
         except (OSError, ValueError):
-            self.s = {}
-        self.s.setdefault("seen", {})       # device id -> hash of the last phone theme handled
-        self.s.setdefault("sent", {})       # device id -> hash of the last Omarchy theme sent
-        self.s.setdefault("ours", {})       # theme name we set ourselves -> its phone "changed"
-        self.last_name = current_theme()
-        self.last = {}
+            self.ours = {}
 
-    def save(self):
-        tmp = self.path + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(self.s, f)
-        os.replace(tmp, self.path)
+    # Reporting
+
+    def emit(self, o):
+        with self.lock:
+            try:
+                self.out.write(json.dumps(o) + "\n")
+                self.out.flush()
+            except (OSError, ValueError):
+                os._exit(0)
+
+    def report(self, force=False):
+        with self.lock:
+            peers = load("peers.json", {})
+            st = {
+                "type": "state", "name": self.name, "theme": current_theme(), "avahi": bool(shutil.which("avahi-browse")),
+                "peers": [{"id": pid, "name": p.get("name", "phone"), "app": p.get("app", ""), "connected": pid in self.lines,
+                           "shows": self.shows.get(pid, ""), "forgot": pid in self.denied} for pid, p in peers.items()],
+                "found": [f for fid, f in self.found.items() if fid not in peers],
+                "pairing": self.pairing, "status": self.status,
+            }
+            if force or st != self.last:
+                self.last = st
+                self.emit(st)
+
+    def say(self, text):
+        self.status = text
+        self.report()
+
+    # Lines to the phones
+
+    def signed(self, key, kind, body=""):
+        with self.lock:
+            ts = max(int(time.time() * 1000), self.last_ts + 1)
+            self.last_ts = ts
+        mac = hmac.new(key, f"{kind}.{ts}.{body}".encode(), hashlib.sha256).hexdigest()
+        return {"t": kind, "id": self.id, "ts": ts, "body": body, "mac": mac}
+
+    def keep_all(self):
+        for pid in load("peers.json", {}):
+            with self.lock:
+                if pid in self.keepers:
+                    continue
+                self.keepers.add(pid)
+            threading.Thread(target=self.keep, args=(pid,), daemon=True).start()
+
+    def keep(self, pid):
+        """One paired phone: connect, subscribe, take its themes, until it is forgotten."""
+        while True:
+            p = load("peers.json", {}).get(pid)
+            if not p:
+                break
+            f = self.found.get(pid)
+            addr = f"{f['host']}:{f['port']}" if f else p.get("addr", "")
+            if not addr or time.time() - self.denied.get(pid, 0) < 60:
+                self.scan_now.set()
+                time.sleep(10)
+                continue
+            host, _, port = addr.rpartition(":")
+            key = bytes.fromhex(p["key"])
+            ln = None
+            try:
+                ln = Line(host, int(port), timeout=10)
+                ln.send(self.signed(key, "sub"))
+                if ln.recv().get("t") != "done":
+                    self.denied[pid] = time.time()
+                    self.report()
+                    continue
+                self.denied.pop(pid, None)
+                ln.s.settimeout(None)
+                if p.get("addr") != addr:
+                    peers = load("peers.json", {})
+                    if pid in peers:
+                        peers[pid]["addr"] = addr
+                        save("peers.json", peers)
+                with self.lock:
+                    self.lines[pid] = ln
+                self.report()
+                got = [False]
+
+                def fallback():
+                    # The phone sends what it shows right away; an older launcher does not, so send ours.
+                    if not got[0]:
+                        self.send(pid)
+                threading.Timer(3, fallback).start()
+                while True:
+                    m = ln.recv()
+                    if m.get("t") == "theme" and m.get("id") == pid and verified(key, m):
+                        got[0] = True
+                        self.from_phone(pid, p, json.loads(m.get("body") or "{}"))
+            except (OSError, ValueError, ConnectionError):
+                pass
+            finally:
+                if ln:
+                    ln.close()
+                with self.lock:
+                    if self.lines.get(pid) is ln:
+                        del self.lines[pid]
+                self.report()
+            self.scan_now.set()
+            time.sleep(5)
+        with self.lock:
+            self.keepers.discard(pid)
+
+    def send(self, pid, t=None):
+        t = t or self.omarchy()
+        p = load("peers.json", {}).get(pid)
+        ln = self.lines.get(pid)
+        if not (t and p and ln):
+            return False
+        try:
+            ln.send(self.signed(bytes.fromhex(p["key"]), "theme", json.dumps(t)))
+        except OSError:
+            return False
+        self.shows[pid] = t["theme"]
+        self.emit({"type": "synced", "direction": "out", "device": p.get("name", "phone"), "theme": current_theme(), "at": int(time.time() * 1000)})
+        self.report()
+        return True
+
+    # Sync
 
     def desktop_changed(self):
-        """When the user last picked a theme here; a switch we made ourselves counts as the phone's time."""
-        name = current_theme()
-        ours = self.s["ours"].get(name)
-        return ours if ours is not None else theme_changed_ms()
+        """When a person last picked the Omarchy theme; a switch we made for a phone carries the phone's time."""
+        if self.ours.get("name") and self.ours["name"] == current_theme():
+            return int(self.ours.get("changed", 0))
+        return theme_changed_ms()
 
-    def tick(self, devs):
-        name = current_theme()
-        if name != self.last_name:
-            self.last_name = name
-            if name not in self.s["ours"]:
-                self.s["ours"] = {}
-            self.save()
-        for d in devs:
-            if not (d["paired"] and d["reachable"] and d["launcher"]):
-                continue
-            t = d.get("theme")
-            if t:
-                self.from_phone(d, t)
-            self.to_phone(d)
-
-    def from_phone(self, d, t):
-        h = hashlib.sha256(json.dumps(t, sort_keys=True).encode()).hexdigest()
-        if self.s["seen"].get(d["id"]) == h:
-            return
-        self.s["seen"][d["id"]] = h
-        self.save()
-        if t.get("echo") or int(t.get("changed") or 0) <= self.desktop_changed():
-            return
-        name = theme_for_phone(t)
-        if not name:
-            return
-        self.s["ours"] = {name: int(t.get("changed") or 0)}
-        self.s["sent"][d["id"]] = None
-        self.save()
-        subprocess.run(["omarchy-theme-set", name], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        self.emit({"type": "synced", "direction": "in", "device": d["name"], "theme": t.get("theme"), "omarchy": name, "at": int(time.time() * 1000)})
-
-    def to_phone(self, d, force=False):
+    def omarchy(self):
         t = omarchy_theme()
-        if not t:
-            return
-        mine = current_theme()
-        if not force:
-            # The phone's own theme is newer, or this is the theme it gave us: nothing to send.
-            pt = d.get("theme") or {}
-            if mine in self.s["ours"]:
+        if t:
+            t["changed"] = self.desktop_changed()
+        return t
+
+    def save_ours(self, o):
+        self.ours = o
+        with open(self.ours_path, "w") as f:
+            json.dump(o, f)
+
+    def from_phone(self, pid, p, t):
+        self.shows[pid] = str(t.get("theme", ""))
+        changed = int(t.get("changed") or 0)
+        mine = self.desktop_changed()
+        if not t.get("echo") and changed > mine:
+            name = theme_for_phone(t)
+            if name:
+                self.save_ours({"name": name, "changed": changed, "source": pid})
+                subprocess.run(["omarchy-theme-set", name], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                self.emit({"type": "synced", "direction": "in", "device": p.get("name", "phone"), "theme": t.get("theme"), "omarchy": name, "at": int(time.time() * 1000)})
+                self.report()
                 return
-            if int(pt.get("changed") or 0) >= self.desktop_changed() and not pt.get("echo"):
-                return
-        t["changed"] = self.desktop_changed()
-        h = hashlib.sha256(json.dumps(t, sort_keys=True).encode()).hexdigest()
-        if not force and self.s["sent"].get(d["id"]) == h:
+        # Not taken. The phone already shows ours, or ours came from it: nothing to send.
+        if changed == mine and (t.get("echo") or self.ours.get("source") == pid):
+            self.report()
             return
-        if call(dev_path(d["id"]) + "/share", "org.kde.kdeconnect.device.share", "shareText", "s", PREFIX + json.dumps(t)) is None:
-            return
-        self.s["sent"][d["id"]] = h
-        self.save()
-        self.emit({"type": "synced", "direction": "out", "device": d["name"], "theme": mine, "at": int(time.time() * 1000)})
+        self.send(pid)
 
+    def desktop_switched(self):
+        """The Omarchy theme changed: tell every phone, but not the one it came from."""
+        name = current_theme()
+        source = self.ours.get("source") if self.ours.get("name") == name else None
+        if not source and self.ours:
+            self.save_ours({})
+        for pid in list(self.lines):
+            if pid != source:
+                self.send(pid)
 
-def status():
-    k = kdeconnect_state()
-    out = {"type": "state", "kdeconnect": k, "name": "", "devices": [], "theme": current_theme()}
-    if k == "ok":
-        out["name"] = self_name()
-        out["devices"] = devices()
-    return out
+    def push(self):
+        if not self.lines:
+            self.say("No phone connected")
+        for pid in list(self.lines):
+            self.send(pid)
 
+    # Pairing
 
-def watch():
-    lock = threading.Lock()
-    def emit(o):
-        with lock:
-            sys.stdout.write(json.dumps(o) + "\n")
-            sys.stdout.flush()
-    sync = Sync(emit)
-    wake = threading.Event()
+    def pair(self, host, port):
+        ports = [port] if port else [PORTS["hyprtile"], PORTS["phosphor"]]
 
-    def monitor():
-        # Any message from kdeconnectd means something may have changed; look again soon.
-        while True:
+        def ask(name, app, code):
+            while not self.answers.empty():
+                self.answers.get_nowait()
+            self.pairing = {"name": name, "app": app, "code": code}
+            self.status = ""
+            self.report()
             try:
-                p = subprocess.Popen(["busctl", "--user", "monitor", BUS], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
-                for _ in p.stdout:
-                    wake.set()
-            except OSError:
-                pass
-            time.sleep(5)
+                return self.answers.get(timeout=PAIR_TIMEOUT) == "yes"
+            except queue.Empty:
+                return False
+            finally:
+                self.pairing = None
+                self.report()
 
-    threading.Thread(target=monitor, daemon=True).start()
-    last = None
-    theme_mtime = theme_changed_ms()
-    next_full = 0.0
-    while True:
-        now = time.time()
-        mt = theme_changed_ms()
-        if wake.is_set() or mt != theme_mtime or now >= next_full:
-            time.sleep(0.3)
-            wake.clear()
-            theme_mtime = mt
-            next_full = now + 10
-            st = status()
-            if st["kdeconnect"] == "ok":
-                try:
-                    sync.tick(st["devices"])
-                except Exception as e:  # keep watching whatever one phone sent
-                    emit({"type": "error", "message": str(e)})
-                st["theme"] = current_theme()
-            for d in st["devices"]:
-                d.pop("theme", None) if d.get("theme") is None else d.update(theme={"theme": d["theme"].get("theme"), "app": d["theme"].get("app")})
-            if st != last:
-                emit(st)
-                last = st
-        wake.wait(1.0)
+        self.say("Asking the phone")
+        last = "Could not reach the phone"
+        for pt in ports:
+            try:
+                pid = pair(host, pt, ask)
+            except (OSError, ConnectionError) as e:
+                last = "Could not reach the phone. Is link on, on the same wifi?" if isinstance(e, (ConnectionRefusedError, socket.timeout)) else f"Pairing broke off ({e})"
+                continue
+            except ValueError as e:
+                last = f"Pairing failed ({e})"
+                break
+            if pid:
+                self.denied.pop(pid, None)
+                self.say("Paired. The theme follows from now on.")
+                self.keep_all()
+            else:
+                self.say("Not paired")
+            return
+        self.say(last)
+
+    def forget(self, pid):
+        peers = load("peers.json", {})
+        peers.pop(pid, None)
+        save("peers.json", peers)
+        ln = self.lines.get(pid)
+        if ln:
+            ln.close()
+        self.say("Forgotten. Forget this computer on the phone too.")
+
+    # Loops
+
+    def commands(self):
+        for line in sys.stdin:
+            a = line.split()
+            if not a:
+                continue
+            c = a[0]
+            if c == "answer" and len(a) == 2:
+                self.answers.put(a[1])
+            elif c == "pair" and len(a) >= 2:
+                host, port = parse_addr(a[1:])
+                threading.Thread(target=self.pair, args=(host, port), daemon=True).start()
+            elif c == "forget" and len(a) == 2:
+                self.forget(a[1])
+            elif c == "push":
+                self.push()
+            elif c == "scan":
+                self.scan_now.set()
+            elif c == "clear":
+                self.say("")
+        # The shell went away.
+        os._exit(0)
+
+    def scanner(self):
+        while True:
+            found = scan()
+            with self.lock:
+                self.found = found
+            self.report()
+            # Look often while a paired phone is missing, else now and then.
+            missing = any(pid not in self.lines for pid in load("peers.json", {}))
+            self.scan_now.wait(15 if missing else 60)
+            self.scan_now.clear()
+
+    def run(self):
+        threading.Thread(target=self.commands, daemon=True).start()
+        threading.Thread(target=self.scanner, daemon=True).start()
+        self.keep_all()
+        self.report(force=True)
+        mtime = theme_changed_ms()
+        while True:
+            time.sleep(1)
+            m = theme_changed_ms()
+            if m != mtime:
+                mtime = m
+                time.sleep(0.5)
+                self.desktop_switched()
+            self.report()
 
 
-def setup():
-    def run(cmd):
-        print("$ " + " ".join(cmd), flush=True)
-        return subprocess.run(cmd).returncode == 0
-    print("Phone Sync setup\n")
-    if kdeconnect_state() == "missing":
-        print("Installing KDE Connect.")
-        if shutil.which("omarchy-pkg-add"):
-            run(["omarchy-pkg-add", "kdeconnect"])
-        else:
-            run(["sudo", "pacman", "-S", "--needed", "--noconfirm", "kdeconnect"])
-    if shutil.which("ufw"):
-        print("\nOpening the KDE Connect ports (1714 to 1764) in the firewall.")
-        run(["sudo", "ufw", "allow", "1714:1764/udp", "comment", "kdeconnect"])
-        run(["sudo", "ufw", "allow", "1714:1764/tcp", "comment", "kdeconnect"])
-    state = kdeconnect_state()
-    print("\nKDE Connect is " + ("running." if state == "ok" else state + "."))
-    if state == "ok":
-        call(ROOT, "org.kde.kdeconnect.daemon", "forceOnNetworkChange")
-        print("This computer shows up as: " + self_name())
-        print("\nOn the phone: open the link menu in Hyprtile or Phosphor, turn link on,")
-        print("then pair this computer from there or from the Phone Sync panel in the bar.")
-    input("\nPress Enter to close. ")
+def parse_addr(a):
+    """'192.168.1.20 47800', '192.168.1.20:47800' or '192.168.1.20' to (host, port or None)."""
+    s = " ".join(a).replace(":", " ").split()
+    host = s[0]
+    port = int(s[1]) if len(s) > 1 and s[1].isdigit() else None
+    return host, port
 
 
 def main():
     a = sys.argv[1:]
-    cmd = a[0] if a else "status"
-    if cmd == "status":
-        print(json.dumps(status(), indent=2))
-    elif cmd == "watch":
+    cmd = a[0] if a else "help"
+    if cmd == "watch":
         try:
-            watch()
-        except (KeyboardInterrupt, BrokenPipeError):
+            Daemon().run()
+        except KeyboardInterrupt:
             pass
-    elif cmd in ("pair", "accept", "reject", "unpair") and len(a) == 2:
-        method = {"pair": "requestPairing", "accept": "acceptPairing", "reject": "cancelPairing", "unpair": "unpair"}[cmd]
-        sys.exit(0 if call(dev_path(a[1]), "org.kde.kdeconnect.device", method) is not None else 1)
-    elif cmd == "push":
-        sync = Sync(lambda o: print(json.dumps(o)))
-        for d in devices():
-            if d["paired"] and d["reachable"] and d["launcher"] and (len(a) < 2 or d["id"] == a[1]):
-                sync.to_phone(d, force=True)
-    elif cmd == "refresh":
-        call(ROOT, "org.kde.kdeconnect.daemon", "forceOnNetworkChange")
-    elif cmd == "setup":
-        setup()
+    elif cmd == "pair" and len(a) >= 2:
+        host, port = parse_addr(a[1:])
+
+        def ask(name, app, code):
+            print(f"Pairing with {name} ({app}).\nCode: {code[:3]} {code[3:]}\nTap pair on the phone if it shows the same code.")
+            return input("Same code here? [y/N] ").strip().lower() in ("y", "yes")
+
+        for pt in [port] if port else [PORTS["hyprtile"], PORTS["phosphor"]]:
+            try:
+                pid = pair(host, pt, ask)
+            except ConnectionRefusedError:
+                continue
+            print("Paired." if pid else "Not paired.")
+            return
+        sys.exit(f"Nothing listens on {host}. Turn link on in the launcher, on the same wifi.")
+    elif cmd == "peers":
+        print(json.dumps([{"id": k, "name": v.get("name"), "app": v.get("app"), "addr": v.get("addr")} for k, v in load("peers.json", {}).items()], indent=2))
     else:
         print(__doc__.strip())
-        sys.exit(2)
+        sys.exit(0 if cmd in ("help", "-h", "--help") else 2)
 
 
 if __name__ == "__main__":
