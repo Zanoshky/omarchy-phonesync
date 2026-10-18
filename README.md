@@ -58,6 +58,14 @@ bin/phonesync pair 192.168.1.20     pair with the phone at that address
 bin/phonesync peers                 list paired phones
 ```
 
+## Rice with an agent
+
+`skills/phone-rice` is an agent skill (a `SKILL.md` folder) for coding agents
+that can run commands. Copy that folder into your agent's skills folder, then
+ask for a rice in plain words, like "a synthwave theme with a pink to cyan
+border". The agent writes a full Omarchy theme, checks its contrast and
+switches to it, and Phone Sync sends it to your phone. Pair the phone first.
+
 ## Privacy
 
 Everything stays on your local network. The plugin sends theme names and
