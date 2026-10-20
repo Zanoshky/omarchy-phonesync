@@ -2,6 +2,7 @@ import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
 import Quickshell
+import Quickshell.Io
 import qs.Commons
 import qs.Commons as Commons
 import qs.Ui
@@ -91,13 +92,18 @@ Panel {
     cursor = 0
     typing = false
     sync.scan()
-    Qt.callLater(function() { if (panel.loadedContent) panel.loadedContent.forceActiveFocus() })
+    Qt.callLater(function() { keys.forceActiveFocus() })
   }
 
   Service { id: sync }
 
-  ShellIpc {
+  // A plain IpcHandler, since ShellIpc is new in Omarchy 4.5. Where the
+  // shell has IpcRegistry it is registered too, so omarchy-shell reaches it.
+  IpcHandler {
+    id: ipc
     target: root.ipcTarget
+    Component.onCompleted: if (typeof IpcRegistry !== "undefined") IpcRegistry.register(ipc)
+    Component.onDestruction: if (typeof IpcRegistry !== "undefined") IpcRegistry.unregister(ipc)
     function open(): void { root.open() }
     function close(): void { root.close() }
     function toggle(): void { root.toggle() }
@@ -117,7 +123,7 @@ Panel {
           color: root.asking ? Commons.Color.accent : root.barForeground
           opacity: root.live || root.asking ? 1.0 : 0.5
           font.family: root.fontFamily
-          font.pixelSize: button.iconSize
+          font.pixelSize: button.iconSize !== undefined ? button.iconSize : Math.min(Style.space(12), button.opticalSize)
         }
       }
     }
@@ -133,13 +139,13 @@ Panel {
     owner: root
     bar: root.bar
     open: root.opened
-    focusTarget: panel.loadedContent
+    focusTarget: keys
     contentWidth: panel.fittedContentWidth(Style.space(380))
-    contentHeight: panel.fittedContentHeight(panel.loadedContentHeight, Style.space(560))
+    contentHeight: panel.fittedContentHeight(column.implicitHeight, Style.space(560))
 
-    content: PanelKeyCatcher {
+    // A plain child, not content:, which Omarchy 4.0 does not have.
+    PanelKeyCatcher {
       id: keys
-      implicitHeight: column.implicitHeight
       anchors.fill: parent
       blocked: root.typing
       onMoveRequested: function(dx, dy) {

@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "zanoshky.phonesync",
   "name": "Phone Sync",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": "Marko Zanoski",
   "license": "MIT",
   "description": "Pair your phone and keep its theme in step with Omarchy, both ways. For the Hyprtile and Phosphor launchers; nothing to install.",
