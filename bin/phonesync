@@ -366,6 +366,48 @@ def background(path, c, wall):
     write_png(path, w, h, pixel)
 
 
+COLOR_KEYS = ("bg", "fg", "accent", "dim", "warn", "urgent", "sun", "bright", "surface", "inactive", "faint")
+NAME_OK = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 ._-")
+
+
+def hex6(c):
+    """#rrggbb, or None. A colour from the phone ends up in colors.toml and the conf Omarchy builds from it."""
+    c = str(c or "").lstrip("#")
+    if len(c) == 8:
+        c = c[2:]
+    return "#" + c.lower() if re.fullmatch(r"[0-9a-fA-F]{6}", c) else None
+
+
+def safe_name(n):
+    """Letters, digits, space, dot, dash and underscore, 64 at most: never a new line or a quote."""
+    return "".join(ch for ch in str(n or "") if ch in NAME_OK)[:64].strip()
+
+
+def clean_phone_theme(t):
+    """What a paired phone sent, cut down to the fields we use, each in a safe shape."""
+    if not isinstance(t, dict):
+        return {}
+    out = {"theme": safe_name(t.get("theme")), "app": safe_name(t.get("app")), "light": bool(t.get("light")), "echo": bool(t.get("echo"))}
+    for k in COLOR_KEYS:
+        v = hex6(t.get(k))
+        if v:
+            out[k] = v
+    for k, most in (("colors", 8), ("ansi", 16), ("wall", 2)):
+        v = t.get(k)
+        if isinstance(v, list):
+            got = [hex6(c) for c in v[:most]]
+            if all(got) and got:
+                out[k] = got
+    origin = t.get("origin")
+    if isinstance(origin, dict):
+        out["origin"] = {"app": safe_name(origin.get("app")), "theme": safe_name(origin.get("theme"))}
+    try:
+        out["changed"] = max(0, int(t.get("changed") or 0))
+    except (TypeError, ValueError):
+        out["changed"] = 0
+    return out
+
+
 def theme_for_phone(t):
     """The Omarchy theme name for a phone theme, writing one from its colours when needed."""
     name = (t.get("theme") or "").lower()
@@ -431,6 +473,7 @@ class Daemon:
         self.status = ""
         self.last = None
         self.last_ts = 0
+        self.phone_ts = {}     # peer id -> newest message time taken from that phone
         self.scan_now = threading.Event()
         os.makedirs(STATE_DIR, exist_ok=True)
         self.ours_path = os.path.join(STATE_DIR, "ours.json")
@@ -518,6 +561,7 @@ class Daemon:
                     self.lines[pid] = ln
                 self.report()
                 got = [False]
+                seen = [self.phone_ts.get(pid, 0)]
 
                 def fallback():
                     # The phone sends what it shows right away; an older launcher does not, so send ours.
@@ -527,8 +571,13 @@ class Daemon:
                 while True:
                     m = ln.recv()
                     if m.get("t") == "theme" and m.get("id") == pid and verified(key, m):
+                        # An old message replayed on the network must not switch the theme back.
+                        ts = m.get("ts")
+                        if not isinstance(ts, int) or isinstance(ts, bool) or ts <= seen[0]:
+                            continue
+                        seen[0] = self.phone_ts[pid] = ts
                         got[0] = True
-                        self.from_phone(pid, p, json.loads(m.get("body") or "{}"))
+                        self.from_phone(pid, p, clean_phone_theme(json.loads(m.get("body") or "{}")))
             except (OSError, ValueError, ConnectionError):
                 pass
             finally:
