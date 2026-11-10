@@ -166,6 +166,8 @@ def pair(host, port, ask):
         nonce = secrets.token_bytes(16)
         ln.send({"t": "hello", "v": 1, "app": "omarchy", "name": name, "id": my_id, "port": 0, "commit": sha(pub + nonce).hex()})
         h = ln.recv()
+        if h.get("t") == "busy":
+            raise ValueError("the phone is busy with another pair prompt, try again in a few seconds")
         their = bytes.fromhex(h.get("pub", ""))
         their_nonce = bytes.fromhex(h.get("nonce", ""))
         if len(their) != 32 or len(their_nonce) != 16:
